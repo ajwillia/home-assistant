@@ -21,15 +21,28 @@ from homeassistant.util import Throttle
 # Return cached results if last scan was less then this time ago.
 MIN_TIME_BETWEEN_SCANS = timedelta(seconds=5)
 
+CONF_PROTOCOL = 'protocol'
+CONF_MODE = 'mode'
+CONF_SSH_KEY = 'ssh_key'
+
 _LOGGER = logging.getLogger(__name__)
+
+REQUIREMENTS = ['pexpect=4.0.1']
 
 _DDWRT_DATA_REGEX = re.compile(r'\{(\w+)::([^\}]*)\}')
 _MAC_REGEX = re.compile(r'(([0-9A-Fa-f]{1,2}\:){5}[0-9A-Fa-f]{1,2})')
 
+_DDWRT_LEASES_CMD = 'cat /tmp/dnsmasq.leases | awk \'{print $2","$4}\''
+_DDWRT_WL_CMD = ('wl -i eth1 assoclist | awk \'{print $2}\' && '
+                 'wl -i eth2 assoclist | awk \'{print $2}\' ;')
+
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Required(CONF_HOST): cv.string,
-    vol.Required(CONF_PASSWORD): cv.string,
-    vol.Required(CONF_USERNAME): cv.string
+    vol.Required(CONF_USERNAME): cv.string,
+    vol.Optional(CONF_PASSWORD): cv.string,
+    vol.Optional(CONF_PROTOCOL, default='http'):
+        vol.In(['http', 'ssh']),
+    vol.Optional(CONF_SSH_KEY): cv.isfile,
 })
 
 
@@ -47,19 +60,36 @@ class DdWrtDeviceScanner(DeviceScanner):
 
     def __init__(self, config):
         """Initialize the scanner."""
-        self.host = config[CONF_HOST]
+        self.host = config[CONF_HOST].split(' ')[0]
+        if len(config[CONF_HOST].split(' ')) > 1:
+            self.aps = config[CONF_HOST].split(' ')[1:]
         self.username = config[CONF_USERNAME]
-        self.password = config[CONF_PASSWORD]
+        self.password = config.get(CONF_PASSWORD, '')
+        self.protocol = config[CONF_PROTOCOL]
+        self.ssh_key = config.get(CONF_SSH_KEY, '')
+
+        if self.protocol == 'ssh':
+            if self.ssh_key:
+                self.ssh_secret = {'ssh_key': self.ssh_key}
+            elif self.password:
+                self.ssh_secret = {'password': self.password}
+            else:
+                _LOGGER.error('No password or private key specified')
+                self.success_init = False
+                return
+        else:
+            if not self.password:
+                _LOGGER.error('No password specified')
+                self.success_init = False
+                return
 
         self.lock = threading.Lock()
 
         self.last_results = {}
-        self.mac2name = {}
+        self.hostname_cache = {}
 
-        # Test the router is accessible
-        url = 'http://{}/Status_Wireless.live.asp'.format(self.host)
-        data = self.get_ddwrt_data(url)
-        if not data:
+        data = self.get_ddwrt_data()
+        if data is None:
             raise ConnectionError('Cannot connect to DD-Wrt router')
 
     def scan_devices(self):
@@ -72,34 +102,10 @@ class DdWrtDeviceScanner(DeviceScanner):
         """Return the name of the given device or None if we don't know."""
         with self.lock:
             # If not initialised and not already scanned and not found.
-            if device not in self.mac2name:
-                url = 'http://{}/Status_Lan.live.asp'.format(self.host)
-                data = self.get_ddwrt_data(url)
+            if device not in self.hostname_cache:
+                self.get_ddwrt_data()
 
-                if not data:
-                    return None
-
-                dhcp_leases = data.get('dhcp_leases', None)
-
-                if not dhcp_leases:
-                    return None
-
-                # Remove leading and trailing quotes and spaces
-                cleaned_str = dhcp_leases.replace(
-                    "\"", "").replace("\'", "").replace(" ", "")
-                elements = cleaned_str.split(',')
-                num_clients = int(len(elements) / 5)
-                self.mac2name = {}
-                for idx in range(0, num_clients):
-                    # The data is a single array
-                    # every 5 elements represents one host, the MAC
-                    # is the third element and the name is the first.
-                    mac_index = (idx * 5) + 2
-                    if mac_index < len(elements):
-                        mac = elements[mac_index]
-                        self.mac2name[mac] = elements[idx * 5]
-
-            return self.mac2name.get(device)
+            return self.hostname_cache.get(device, False)
 
     @Throttle(MIN_TIME_BETWEEN_SCANS)
     def _update_info(self):
@@ -108,51 +114,121 @@ class DdWrtDeviceScanner(DeviceScanner):
         Return boolean if scanning successful.
         """
         with self.lock:
-            _LOGGER.info('Checking ARP')
-
-            url = 'http://{}/Status_Wireless.live.asp'.format(self.host)
-            data = self.get_ddwrt_data(url)
-
-            if not data:
-                return False
+            _LOGGER.info('Checking wireless clients')
 
             self.last_results = []
 
-            active_clients = data.get('active_wireless', None)
+            active_clients = self.get_ddwrt_data()
+
             if not active_clients:
                 return False
 
-            # The DD-WRT UI uses its own data format and then
-            # regex's out values so this is done here too
-            # Remove leading and trailing single quotes.
-            clean_str = active_clients.strip().strip("'")
-            elements = clean_str.split("','")
-
-            self.last_results.extend(item for item in elements
-                                     if _MAC_REGEX.match(item))
+            self.last_results.extend(active_clients)
 
             return True
 
-    def get_ddwrt_data(self, url):
-        """Retrieve data from DD-WRT and return parsed result."""
+    def http_connection(self, url):
+        """Retrieve data from DD-WRT by http."""
         try:
             response = requests.get(
                 url,
                 auth=(self.username, self.password),
                 timeout=4)
         except requests.exceptions.Timeout:
-            _LOGGER.exception('Connection to the router timed out')
+            _LOGGER.error('Connection to the router timed out')
             return
         if response.status_code == 200:
+            _LOGGER.debug('Received {0}'.format(response.text))
             return _parse_ddwrt_response(response.text)
         elif response.status_code == 401:
             # Authentication error
-            _LOGGER.exception(
+            _LOGGER.error(
                 'Failed to authenticate, '
                 'please check your username and password')
             return
         else:
             _LOGGER.error('Invalid response from ddwrt: %s', response)
+
+    def ssh_connection(self, host, cmds):
+        """Retrieve data from DD-WRT by ssh."""
+        from pexpect import pxssh, exceptions
+
+        ssh = pxssh.pxssh()
+        try:
+            ssh.login(host, self.username, **self.ssh_secret)
+        except exceptions.EOF as err:
+            _LOGGER.error('Connection refused. Is SSH enabled?')
+            return None
+        except pxssh.ExceptionPxssh as err:
+            _LOGGER.error('Unable to connect via SSH: %s', str(err))
+            return None
+
+        try:
+            output = []
+            for cmd in cmds:
+                ssh.sendline(cmd)
+                ssh.prompt()
+                output.append(ssh.before.split(b'\n')[1:-1])
+            ssh.logout()
+            return output
+
+        except pxssh.ExceptionPxssh as exc:
+            _LOGGER.error('Unexpected response from router: %s', exc)
+            return None
+
+    def get_ddwrt_data(self):
+        """Retrieve data from DD-WRT and return parsed result."""
+        if self.protocol == 'http':
+            if not self.hostname_cache:
+                _LOGGER.debug('Getting hostnames')
+                # get hostnames from dhcp leases
+                url = 'http://{}/Status_Lan.live.asp'.format(self.host)
+                data = self.http_connection(url)
+
+                # no data received
+                if data is None:
+                    _LOGGER.debug('No hostname data received')
+                    return None
+
+                dhcp_leases = data.get('dhcp_leases', None)
+
+                # parse and cache leases
+                if dhcp_leases:
+                    _LOGGER.debug('Parsing http leases')
+                    self.hostname_cache = _parse_http_leases(dhcp_leases)
+
+            _LOGGER.debug('Getting active clients')
+            # get active wireless clients
+            url = 'http://{}/Status_Wireless.live.asp'.format(self.host)
+            data = self.http_connection(url)
+
+            if data is None:
+                _LOGGER.debug('No active clients received')
+                return None
+
+            _LOGGER.debug('Parsing http clients')
+            return _parse_http_wireless(data.get('active_wireless', None))
+
+        elif self.protocol == 'ssh':
+            if not self.hostname_cache:
+                host_data = self.ssh_connection(self.host,
+                                                [_DDWRT_LEASES_CMD,
+                                                 _DDWRT_WL_CMD])
+                if not host_data:
+                    return None
+                self.hostname_cache = {line.split(",")[0]: line.split(",")[1]
+                                       for line in host_data[0]}
+                active_clients = [mac.lower() for mac in host_data[1]]
+            else:
+                if not host_data:
+                    return None
+                host_data = self.ssh_connection(self.host, [_DDWRT_WL_CMD])
+                active_clients = [mac.lower() for mac in host_data[1]]
+            for access_point in self.aps:
+                ap_data = self.ssh_connection(access_point, [_DDWRT_WL_CMD])
+                active_clients.extends([mac.lower() for mac in ap_data])
+
+            return active_clients
 
 
 def _parse_ddwrt_response(data_str):
@@ -160,3 +236,37 @@ def _parse_ddwrt_response(data_str):
     return {
         key: val for key, val in _DDWRT_DATA_REGEX
         .findall(data_str)}
+
+
+def _parse_http_leases(dhcp_leases):
+    """Parse lease data returned by web."""
+    # Remove leading and trailing quotes and spaces
+    cleaned_str = dhcp_leases.replace(
+        "\"", "").replace("\'", "").replace(" ", "")
+    elements = cleaned_str.split(',')
+    num_clients = int(len(elements) / 5)
+    hostname_cache = {}
+    for idx in range(0, num_clients):
+        # The data is a single array
+        # every 5 elements represents one host, the MAC
+        # is the third element and the name is the first.
+        mac_index = (idx * 5) + 2
+        if mac_index < len(elements):
+            mac = elements[mac_index]
+            hostname_cache[mac] = elements[idx * 5]
+
+    return hostname_cache
+
+
+def _parse_http_wireless(active_wireless):
+    """Parse wireless data returned by web."""
+    if not active_wireless:
+        return False
+
+    # The DD-WRT UI uses its own data format and then
+    # regex's out values so this is done here too
+    # Remove leading and trailing single quotes.
+    clean_str = active_wireless.strip().strip("'")
+    elements = clean_str.split("','")
+
+    return [item for item in elements if _MAC_REGEX.match(item)]

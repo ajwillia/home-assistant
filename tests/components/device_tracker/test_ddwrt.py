@@ -55,7 +55,7 @@ class TestDdwrt(unittest.TestCase):
         """Create a Ddwrt scanner with wrong credentials."""
         with requests_mock.Mocker() as mock_request:
             mock_request.register_uri(
-                'GET', r'http://%s/Status_Wireless.live.asp' % TEST_HOST,
+                'GET', r'http://%s/Status_Lan.live.asp' % TEST_HOST,
                 status_code=401)
             with assert_setup_component(1):
                 assert setup_component(
@@ -75,7 +75,7 @@ class TestDdwrt(unittest.TestCase):
         """Test error handling when response has an error status."""
         with requests_mock.Mocker() as mock_request:
             mock_request.register_uri(
-                'GET', r'http://%s/Status_Wireless.live.asp' % TEST_HOST,
+                'GET', r'http://%s/Status_Lan.live.asp' % TEST_HOST,
                 status_code=444)
             with assert_setup_component(1):
                 assert setup_component(
