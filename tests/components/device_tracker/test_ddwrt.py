@@ -6,13 +6,17 @@ import logging
 import re
 import requests
 import requests_mock
+import pexpect
+from pexpect.pxssh import ExceptionPxssh
 
 from homeassistant import config
 from homeassistant.setup import setup_component
 from homeassistant.components import device_tracker
 from homeassistant.const import (
-    CONF_PLATFORM, CONF_HOST, CONF_PASSWORD, CONF_USERNAME)
+    CONF_PLATFORM, CONF_HOST, CONF_HOSTS, CONF_PASSWORD, CONF_USERNAME)
 from homeassistant.components.device_tracker import DOMAIN
+from homeassistant.components.device_tracker.ddwrt import (
+    CONF_PROTOCOL, CONF_SSH_KEY)
 from homeassistant.util import slugify
 
 from tests.common import (
@@ -51,7 +55,7 @@ class TestDdwrt(unittest.TestCase):
             pass
 
     @mock.patch('homeassistant.components.device_tracker.ddwrt._LOGGER.error')
-    def test_login_failed(self, mock_error):
+    def test_http_login_failed(self, mock_error):
         """Create a Ddwrt scanner with wrong credentials."""
         with requests_mock.Mocker() as mock_request:
             mock_request.register_uri(
@@ -71,7 +75,53 @@ class TestDdwrt(unittest.TestCase):
                     str(mock_error.call_args_list[-1]))
 
     @mock.patch('homeassistant.components.device_tracker.ddwrt._LOGGER.error')
-    def test_invalid_response(self, mock_error):
+    def test_ssh_login_connection_refused(self, mock_error):
+        """Create a Ddwrt scanner when connection is refused"""
+        ssh = mock.MagicMock()
+        mock_ssh = mock.patch('pexpect.pxssh.pxssh', return_value=ssh)
+        attrs = {'login.side_effect': pexpect.exceptions.EOF('mocked EOF error')}
+        ssh.configure_mock(**attrs)
+        mock_ssh.start()
+        self.addCleanup(mock_ssh.stop)
+        with assert_setup_component(1):
+            assert setup_component(
+                self.hass, DOMAIN, {DOMAIN: {
+                    CONF_PLATFORM: 'ddwrt',
+                    CONF_HOST: TEST_HOST,
+                    CONF_USERNAME: 'fake_user',
+                    CONF_PASSWORD: '0',
+                    CONF_PROTOCOL: 'ssh',
+                }})
+
+            self.assertTrue(
+                'Connection refused. Is SSH enabled?' in
+                str(mock_error.call_args_list[-1]))
+
+    @mock.patch('homeassistant.components.device_tracker.ddwrt._LOGGER.error')
+    def test_ssh_login_unable_to_connect(self, mock_error):
+        """Create a Ddwrt scanner when you can't connect"""
+        ssh = mock.MagicMock()
+        mock_ssh = mock.patch('pexpect.pxssh.pxssh', return_value=ssh)
+        attrs = {'login.side_effect': ExceptionPxssh('mocked Pxssh error')}
+        ssh.configure_mock(**attrs)
+        mock_ssh.start()
+        self.addCleanup(mock_ssh.stop)
+        with assert_setup_component(1):
+            assert setup_component(
+                self.hass, DOMAIN, {DOMAIN: {
+                    CONF_PLATFORM: 'ddwrt',
+                    CONF_HOST: TEST_HOST,
+                    CONF_USERNAME: 'fake_user',
+                    CONF_PASSWORD: '0',
+                    CONF_PROTOCOL: 'ssh',
+                }})
+
+            self.assertTrue(
+                'Unable to connect via SSH' in
+                str(mock_error.call_args_list[-1]))
+
+    @mock.patch('homeassistant.components.device_tracker.ddwrt._LOGGER.error')
+    def test_http_invalid_response(self, mock_error):
         """Test error handling when response has an error status."""
         with requests_mock.Mocker() as mock_request:
             mock_request.register_uri(
@@ -90,10 +140,33 @@ class TestDdwrt(unittest.TestCase):
                     'Invalid response from ddwrt' in
                     str(mock_error.call_args_list[-1]))
 
+    @mock.patch('homeassistant.components.device_tracker.ddwrt._LOGGER.error')
+    def test_ssh_invalid_response(self, mock_error):
+        """Test error handling when ssh response is invalid."""
+        ssh = mock.MagicMock()
+        mock_ssh = mock.patch('pexpect.pxssh.pxssh', return_value=ssh)
+        attrs = {'prompt.side_effect': ExceptionPxssh('mocked Pxssh error')}
+        ssh.configure_mock(**attrs)
+        mock_ssh.start()
+        self.addCleanup(mock_ssh.stop)
+        with assert_setup_component(1):
+            assert setup_component(
+                self.hass, DOMAIN, {DOMAIN: {
+                    CONF_PLATFORM: 'ddwrt',
+                    CONF_HOST: TEST_HOST,
+                    CONF_USERNAME: 'fake_user',
+                    CONF_PASSWORD: '0',
+                    CONF_PROTOCOL: 'ssh',
+                }})
+
+            self.assertTrue(
+                'Unexpected response from router' in
+                str(mock_error.call_args_list[-1]))
+
     @mock.patch('homeassistant.components.device_tracker._LOGGER.error')
     @mock.patch('homeassistant.components.device_tracker.'
                 'ddwrt.DdWrtDeviceScanner.get_ddwrt_data', return_value=None)
-    def test_no_response(self, data_mock, error_mock):
+    def test_http_no_response(self, data_mock, error_mock):
         """Create a Ddwrt scanner with no response in init, should fail."""
         with assert_setup_component(1):
             assert setup_component(
@@ -110,7 +183,7 @@ class TestDdwrt(unittest.TestCase):
     @mock.patch('homeassistant.components.device_tracker.ddwrt.requests.get',
                 side_effect=requests.exceptions.Timeout)
     @mock.patch('homeassistant.components.device_tracker.ddwrt._LOGGER.error')
-    def test_get_timeout(self, mock_error, mock_request):
+    def test_http_get_timeout(self, mock_error, mock_request):
         """Test get Ddwrt data with request time out."""
         with assert_setup_component(1):
             assert setup_component(
@@ -125,7 +198,7 @@ class TestDdwrt(unittest.TestCase):
                 'Connection to the router timed out' in
                 str(mock_error.call_args_list[-1]))
 
-    def test_scan_devices(self):
+    def test_http_scan_devices(self):
         """Test creating device info (MAC, name) from response.
 
         The created known_devices.yaml device info is compared
@@ -159,8 +232,20 @@ class TestDdwrt(unittest.TestCase):
                 self.assertIn(
                     slugify(devices[device]['name']),
                     load_fixture('Ddwrt_Status_Lan.txt'))
+    
+    def test_ssh_scan_devices(self):
+        """Test creating device info (MAC, name) from response.
+        
+        The created known_devices.yaml device info is compared
+        ...."""
+        leases_fixture = [[
+            'aa:bb:cc:dd:ee:00,device_1',
+            'aa:bb:cc:dd:ee:01,device_2',
+            'aa:bb:cc:dd:ee:02,device_3'],[
+            'AA:BB:CC:DD:EE:00',
+            'AA:BB:CC:DD:EE:01']]
 
-    def test_device_name_no_data(self):
+    def test_http_device_name_no_data(self):
         """Test creating device info (MAC only) when no response."""
         with requests_mock.Mocker() as mock_request:
             mock_request.register_uri(
@@ -187,7 +272,7 @@ class TestDdwrt(unittest.TestCase):
                     devices[device]['mac'],
                     load_fixture('Ddwrt_Status_Lan.txt'))
 
-    def test_device_name_no_dhcp(self):
+    def test_http_device_name_no_dhcp(self):
         """Test creating device info (MAC) when missing dhcp response."""
         with requests_mock.Mocker() as mock_request:
             mock_request.register_uri(
@@ -216,7 +301,7 @@ class TestDdwrt(unittest.TestCase):
                     devices[device]['mac'],
                     load_fixture('Ddwrt_Status_Lan.txt'))
 
-    def test_update_no_data(self):
+    def test_http_update_no_data(self):
         """Test error handling of no response when active devices checked."""
         with requests_mock.Mocker() as mock_request:
             mock_request.register_uri(
@@ -238,7 +323,7 @@ class TestDdwrt(unittest.TestCase):
                         CONF_PASSWORD: '0'
                     }})
 
-    def test_update_wrong_data(self):
+    def test_http_update_wrong_data(self):
         """Test error handling of bad response when active devices checked."""
         with requests_mock.Mocker() as mock_request:
             mock_request.register_uri(

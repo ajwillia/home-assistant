@@ -15,15 +15,15 @@ import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
 from homeassistant.components.device_tracker import (
     DOMAIN, PLATFORM_SCHEMA, DeviceScanner)
-from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
+from homeassistant.const import CONF_HOST, CONF_HOSTS, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.util import Throttle
 
 # Return cached results if last scan was less then this time ago.
 MIN_TIME_BETWEEN_SCANS = timedelta(seconds=5)
 
 CONF_PROTOCOL = 'protocol'
-CONF_MODE = 'mode'
 CONF_SSH_KEY = 'ssh_key'
+HOST_GROUP = 'Single host or list of hosts'
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -37,7 +37,8 @@ _DDWRT_WL_CMD = ('wl -i eth1 assoclist | awk \'{print $2}\' && '
                  'wl -i eth2 assoclist | awk \'{print $2}\' ;')
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_HOST): cv.string,
+    vol.Exclusive(CONF_HOST, HOST_GROUP): cv.string,
+    vol.Exclusive(CONF_HOSTS, HOST_GROUP): cv.ensure_list,
     vol.Required(CONF_USERNAME): cv.string,
     vol.Optional(CONF_PASSWORD): cv.string,
     vol.Optional(CONF_PROTOCOL, default='http'):
@@ -60,9 +61,16 @@ class DdWrtDeviceScanner(DeviceScanner):
 
     def __init__(self, config):
         """Initialize the scanner."""
-        self.host = config[CONF_HOST].split(' ')[0]
-        if len(config[CONF_HOST].split(' ')) > 1:
-            self.aps = config[CONF_HOST].split(' ')[1:]
+        host = config.get(CONF_HOST, '')
+        hosts = config.get(CONF_HOSTS, [])
+        if host:
+            self.host = host
+            self.aps = []
+        elif hosts:
+            self.host = hosts[0]
+            self.aps = []
+            if len(hosts) > 1:
+                self.aps = hosts[1:]
         self.username = config[CONF_USERNAME]
         self.password = config.get(CONF_PASSWORD, '')
         self.protocol = config[CONF_PROTOCOL]
@@ -157,9 +165,11 @@ class DdWrtDeviceScanner(DeviceScanner):
         try:
             ssh.login(host, self.username, **self.ssh_secret)
         except exceptions.EOF as err:
+            _LOGGER.debug('Connection refused. Is SSH enabled?')
             _LOGGER.error('Connection refused. Is SSH enabled?')
             return None
         except pxssh.ExceptionPxssh as err:
+            _LOGGER.debug('Unable to connect via SSH: %s', str(err))
             _LOGGER.error('Unable to connect via SSH: %s', str(err))
             return None
 
@@ -173,6 +183,7 @@ class DdWrtDeviceScanner(DeviceScanner):
             return output
 
         except pxssh.ExceptionPxssh as exc:
+            _LOGGER.debug('Unexpected response from router: %s', exc)
             _LOGGER.error('Unexpected response from router: %s', exc)
             return None
 
@@ -223,10 +234,10 @@ class DdWrtDeviceScanner(DeviceScanner):
                 if not host_data:
                     return None
                 host_data = self.ssh_connection(self.host, [_DDWRT_WL_CMD])
-                active_clients = [mac.lower() for mac in host_data[1]]
+                active_clients = [mac.lower() for mac in host_data[0]]
             for access_point in self.aps:
                 ap_data = self.ssh_connection(access_point, [_DDWRT_WL_CMD])
-                active_clients.extends([mac.lower() for mac in ap_data])
+                active_clients.extends([mac.lower() for mac in ap_data[0]])
 
             return active_clients
 
