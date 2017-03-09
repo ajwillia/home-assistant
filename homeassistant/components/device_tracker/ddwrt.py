@@ -165,11 +165,9 @@ class DdWrtDeviceScanner(DeviceScanner):
         try:
             ssh.login(host, self.username, **self.ssh_secret)
         except exceptions.EOF as err:
-            _LOGGER.debug('Connection refused. Is SSH enabled?')
             _LOGGER.error('Connection refused. Is SSH enabled?')
             return None
         except pxssh.ExceptionPxssh as err:
-            _LOGGER.debug('Unable to connect via SSH: %s', str(err))
             _LOGGER.error('Unable to connect via SSH: %s', str(err))
             return None
 
@@ -180,10 +178,11 @@ class DdWrtDeviceScanner(DeviceScanner):
                 ssh.prompt()
                 output.append(ssh.before.split(b'\n')[1:-1])
             ssh.logout()
+            _LOGGER.debug('Commands {0} in {1} returned {2}'.format(host,
+                str(cmds), str(output)))
             return output
 
         except pxssh.ExceptionPxssh as exc:
-            _LOGGER.debug('Unexpected response from router: %s', exc)
             _LOGGER.error('Unexpected response from router: %s', exc)
             return None
 
@@ -221,23 +220,29 @@ class DdWrtDeviceScanner(DeviceScanner):
             return _parse_http_wireless(data.get('active_wireless', None))
 
         elif self.protocol == 'ssh':
+            active_clients = []
             if not self.hostname_cache:
                 host_data = self.ssh_connection(self.host,
                                                 [_DDWRT_LEASES_CMD,
                                                  _DDWRT_WL_CMD])
+                _LOGGER.debug('host_cache_data: {0}'.format(str(host_data)))
                 if not host_data:
                     return None
+
                 self.hostname_cache = {line.split(",")[0]: line.split(",")[1]
                                        for line in host_data[0]}
                 active_clients = [mac.lower() for mac in host_data[1]]
             else:
-                if not host_data:
-                    return None
                 host_data = self.ssh_connection(self.host, [_DDWRT_WL_CMD])
-                active_clients = [mac.lower() for mac in host_data[0]]
+                _LOGGER.debug('host_data: {0}'.format(str(host_data)))
+                if host_data:
+                    active_clients = [mac.lower() for mac in host_data[0]]
+
             for access_point in self.aps:
                 ap_data = self.ssh_connection(access_point, [_DDWRT_WL_CMD])
-                active_clients.extends([mac.lower() for mac in ap_data[0]])
+                _LOGGER.debug('ap_data: {0}'.format(str(ap_data)))
+                if ap_data:
+                    active_clients.extends([mac.lower() for mac in ap_data[0]])
 
             return active_clients
 

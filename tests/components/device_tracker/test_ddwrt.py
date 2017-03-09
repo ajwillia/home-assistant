@@ -233,17 +233,39 @@ class TestDdwrt(unittest.TestCase):
                     slugify(devices[device]['name']),
                     load_fixture('Ddwrt_Status_Lan.txt'))
     
-    def test_ssh_scan_devices(self):
+    @mock.patch('homeassistant.components.device_tracker.ddwrt.DdWrtDeviceScanner.ssh_connection',
+                side_effect=[[['aa:bb:cc:dd:ee:00,device_1',
+                               'aa:bb:cc:dd:ee:01,device_2',
+                               'aa:bb:cc:dd:ee:02,device_3'],[
+                               'AA:BB:CC:DD:EE:00',
+                               'AA:BB:CC:DD:EE:01']],
+                             [['AA:BB:CC:DD:EE:00',
+                               'AA:BB:CC:DD:EE:01']]])
+    def test_ssh_scan_devices(self, mock_ssh):
         """Test creating device info (MAC, name) from response.
         
         The created known_devices.yaml device info is compared
         ...."""
-        leases_fixture = [[
-            'aa:bb:cc:dd:ee:00,device_1',
-            'aa:bb:cc:dd:ee:01,device_2',
-            'aa:bb:cc:dd:ee:02,device_3'],[
-            'AA:BB:CC:DD:EE:00',
-            'AA:BB:CC:DD:EE:01']]
+        with assert_setup_component(1):
+            assert setup_component(
+                self.hass, DOMAIN, {DOMAIN: {
+                    CONF_PLATFORM: 'ddwrt',
+                    CONF_HOST: TEST_HOST,
+                    CONF_USERNAME: 'fake_user',
+                    CONF_PASSWORD: '0',
+                    CONF_PROTOCOL: 'ssh',
+                }})
+            self.hass.block_till_done()
+
+        path = self.hass.config.path(device_tracker.YAML_DEVICES)
+        devices = config.load_yaml_config_file(path)
+        for device in devices:
+            self.assertIn(
+                devices[device]['mac'],
+                ['AA:BB:CC:DD:EE:00', 'AA:BB:CC:DD:EE:01', 'AA:BB:CC:DD:EE:02'])
+            self.assertIn(
+                slugify(devices[device]['name']),
+                ['device_1', 'device_2', 'device_3'])
 
     def test_http_device_name_no_data(self):
         """Test creating device info (MAC only) when no response."""
