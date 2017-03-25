@@ -70,7 +70,7 @@ class DdWrtDeviceScanner(DeviceScanner):
         hosts = config.get(CONF_HOSTS, [])
         if host:
             self.host = host
-            self.aps = [host,]
+            self.aps = []
         elif hosts:
             self.host = hosts[0]
             self.aps = []
@@ -228,16 +228,20 @@ class DdWrtDeviceScanner(DeviceScanner):
             return _parse_http_wireless(data.get('active_wireless', None))
 
         elif self.protocol == 'ssh':
-            from pexpect import pxssh, exceptions
-
-
             active_clients = []
-            # loop through all aps
             if self.use_iw:
+                from pexpect import pxssh, exceptions
                 ssh = pxssh.pxssh()
-                for ap in self.aps:
+                # setup to loop through multiple aps/devices.
+                # this is better configured in __init__
+                if len(self.aps) == 0:
+                    devices = [self.host, ]
+                else:
+                    devices = self.aps
+                # loop through all of the APs/devices to get device data
+                for d in devices:
                     try:
-                        ssh.login(ap, self.username, **self.ssh_secret)
+                        ssh.login(d, self.username, **self.ssh_secret)
                     except exceptions.EOF as err:
                         _LOGGER.error('Connection refused. Is SSH enabled?')
                         return None
@@ -246,18 +250,22 @@ class DdWrtDeviceScanner(DeviceScanner):
                                       str(err))
                         return None
 
+                    # get the dhcp leases for hostname lookup
                     ssh.sendline(_DDWRT_LEASES_CMD)
                     ssh.prompt()
                     output = _parse_ssh_output(ssh.before)
                     for line in output:
                         mac, host = line.split(",", 1)
+                        # update the hostname cache
                         self.hostname_cache.setdefault(mac.lower(),
                                                        host.strip())
 
+                    # get a list of wireless interfaces
                     ssh.sendline(_DDWRT_IW_INTERFACES_CMD)
                     ssh.prompt()
                     interfaces = _parse_ssh_output(ssh.before)
-                    active_clients = []
+
+                    # loop through each interface and get the wireless clients
                     for interface in interfaces:
                         ssh.sendline(
                             _DDWRT_IW_STATIONS_CMD.format(interface=interface))
@@ -294,6 +302,7 @@ class DdWrtDeviceScanner(DeviceScanner):
 
 
 def _parse_ssh_output(data):
+    """parse output from ssh"""
     data = data.decode('ascii')
     return data.split('\r\n')[1:-1]
 
