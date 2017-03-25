@@ -27,14 +27,14 @@ HOST_GROUP = 'Single host or list of hosts'
 
 _LOGGER = logging.getLogger(__name__)
 
-REQUIREMENTS = ['pexpect=4.0.1']
+REQUIREMENTS = ['pexpect==4.0.1']
 
 _DDWRT_DATA_REGEX = re.compile(r'\{(\w+)::([^\}]*)\}')
 _MAC_REGEX = re.compile(r'(([0-9A-Fa-f]{1,2}\:){5}[0-9A-Fa-f]{1,2})')
 
 _DDWRT_LEASES_CMD = 'cat /tmp/dnsmasq.leases | awk \'{print $2","$4}\''
 _DDWRT_WL_CMD = ('wl -i eth1 assoclist | awk \'{print $2}\' && '
-                 'wl -i eth2 assoclist | awk \'{print $2}\' ;')
+                 'wl -i eth2 assoclist | awk \'{print $2}\'')
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Exclusive(CONF_HOST, HOST_GROUP): cv.string,
@@ -176,7 +176,7 @@ class DdWrtDeviceScanner(DeviceScanner):
             for cmd in cmds:
                 ssh.sendline(cmd)
                 ssh.prompt()
-                output.append(ssh.before.split(b'\n')[1:-1])
+                output.append(ssh.before.split(b'\r\n')[1:-1])
             ssh.logout()
             _LOGGER.debug('Commands {0} in {1} returned {2}'.format(host,
                 str(cmds), str(output)))
@@ -229,20 +229,20 @@ class DdWrtDeviceScanner(DeviceScanner):
                 if not host_data:
                     return None
 
-                self.hostname_cache = {line.split(",")[0]: line.split(",")[1]
+                self.hostname_cache = {line.split(b',')[0]: line.split(b',')[1]
                                        for line in host_data[0]}
-                active_clients = [mac.lower() for mac in host_data[1]]
+                active_clients = [mac.lower() for mac in host_data[1][1:]]
             else:
                 host_data = self.ssh_connection(self.host, [_DDWRT_WL_CMD])
                 _LOGGER.debug('host_data: {0}'.format(str(host_data)))
                 if host_data:
-                    active_clients = [mac.lower() for mac in host_data[0]]
+                    active_clients = [mac.lower() for mac in host_data[0][1:]]
 
             for access_point in self.aps:
                 ap_data = self.ssh_connection(access_point, [_DDWRT_WL_CMD])
                 _LOGGER.debug('ap_data: {0}'.format(str(ap_data)))
                 if ap_data:
-                    active_clients.extends([mac.lower() for mac in ap_data[0]])
+                    active_clients.extend([mac.lower() for mac in ap_data[0][1:]])
 
             return active_clients
 
