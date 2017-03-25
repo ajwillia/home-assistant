@@ -15,21 +15,40 @@ import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
 from homeassistant.components.device_tracker import (
     DOMAIN, PLATFORM_SCHEMA, DeviceScanner)
-from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
+from homeassistant.const import CONF_HOST, CONF_HOSTS, CONF_PASSWORD, \
+    CONF_USERNAME
 from homeassistant.util import Throttle
 
 # Return cached results if last scan was less then this time ago.
 MIN_TIME_BETWEEN_SCANS = timedelta(seconds=5)
 
+CONF_PROTOCOL = 'protocol'
+CONF_SSH_KEY = 'ssh_key'
+HOST_GROUP = 'Single host or list of hosts'
+CONF_USE_IW = 'use_iw'
 _LOGGER = logging.getLogger(__name__)
+
+REQUIREMENTS = ['pexpect==4.0.1']
 
 _DDWRT_DATA_REGEX = re.compile(r'\{(\w+)::([^\}]*)\}')
 _MAC_REGEX = re.compile(r'(([0-9A-Fa-f]{1,2}\:){5}[0-9A-Fa-f]{1,2})')
 
+_DDWRT_LEASES_CMD = 'cat /tmp/dnsmasq.leases | awk \'{print $2","$4}\''
+_DDWRT_WL_CMD = ('wl -i eth1 assoclist | awk \'{print $2}\' && '
+                 'wl -i eth2 assoclist | awk \'{print $2}\' ;')
+_DDWRT_IW_INTERFACES_CMD = 'iw dev | grep Interface | awk \'{print $2}\''
+_DDWRT_IW_STATIONS_CMD = 'iw dev {interface} station dump | grep Station ' \
+                         ' | awk \'{{ print $2}}\''
+
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_HOST): cv.string,
-    vol.Required(CONF_PASSWORD): cv.string,
-    vol.Required(CONF_USERNAME): cv.string
+    vol.Exclusive(CONF_HOST, HOST_GROUP): cv.string,
+    vol.Exclusive(CONF_HOSTS, HOST_GROUP): cv.ensure_list,
+    vol.Required(CONF_USERNAME): cv.string,
+    vol.Optional(CONF_PASSWORD): cv.string,
+    vol.Optional(CONF_PROTOCOL, default='http'):
+        vol.In(['http', 'ssh']),
+    vol.Optional(CONF_SSH_KEY): cv.isfile,
+    vol.Optional(CONF_USE_IW, default=False): cv.boolean
 })
 
 
@@ -47,19 +66,44 @@ class DdWrtDeviceScanner(DeviceScanner):
 
     def __init__(self, config):
         """Initialize the scanner."""
-        self.host = config[CONF_HOST]
+        host = config.get(CONF_HOST, '')
+        hosts = config.get(CONF_HOSTS, [])
+        if host:
+            self.host = host
+            self.aps = [host,]
+        elif hosts:
+            self.host = hosts[0]
+            self.aps = []
+            if len(hosts) > 1:
+                self.aps = hosts[1:]
         self.username = config[CONF_USERNAME]
-        self.password = config[CONF_PASSWORD]
+        self.password = config.get(CONF_PASSWORD, '')
+        self.protocol = config[CONF_PROTOCOL]
+        self.ssh_key = config.get(CONF_SSH_KEY, '')
+        self.use_iw = config[CONF_USE_IW]
+
+        if self.protocol == 'ssh':
+            if self.ssh_key:
+                self.ssh_secret = {'ssh_key': self.ssh_key}
+            elif self.password:
+                self.ssh_secret = {'password': self.password}
+            else:
+                _LOGGER.error('No password or private key specified')
+                self.success_init = False
+                return
+        else:
+            if not self.password:
+                _LOGGER.error('No password specified')
+                self.success_init = False
+                return
 
         self.lock = threading.Lock()
 
         self.last_results = {}
-        self.mac2name = {}
+        self.hostname_cache = {}
 
-        # Test the router is accessible
-        url = 'http://{}/Status_Wireless.live.asp'.format(self.host)
-        data = self.get_ddwrt_data(url)
-        if not data:
+        data = self.get_ddwrt_data()
+        if data is None:
             raise ConnectionError('Cannot connect to DD-Wrt router')
 
     def scan_devices(self):
@@ -72,34 +116,10 @@ class DdWrtDeviceScanner(DeviceScanner):
         """Return the name of the given device or None if we don't know."""
         with self.lock:
             # If not initialised and not already scanned and not found.
-            if device not in self.mac2name:
-                url = 'http://{}/Status_Lan.live.asp'.format(self.host)
-                data = self.get_ddwrt_data(url)
+            if device not in self.hostname_cache:
+                self.get_ddwrt_data()
 
-                if not data:
-                    return None
-
-                dhcp_leases = data.get('dhcp_leases', None)
-
-                if not dhcp_leases:
-                    return None
-
-                # Remove leading and trailing quotes and spaces
-                cleaned_str = dhcp_leases.replace(
-                    "\"", "").replace("\'", "").replace(" ", "")
-                elements = cleaned_str.split(',')
-                num_clients = int(len(elements) / 5)
-                self.mac2name = {}
-                for idx in range(0, num_clients):
-                    # The data is a single array
-                    # every 5 elements represents one host, the MAC
-                    # is the third element and the name is the first.
-                    mac_index = (idx * 5) + 2
-                    if mac_index < len(elements):
-                        mac = elements[mac_index]
-                        self.mac2name[mac] = elements[idx * 5]
-
-            return self.mac2name.get(device)
+            return self.hostname_cache.get(device, False)
 
     @Throttle(MIN_TIME_BETWEEN_SCANS)
     def _update_info(self):
@@ -108,55 +128,210 @@ class DdWrtDeviceScanner(DeviceScanner):
         Return boolean if scanning successful.
         """
         with self.lock:
-            _LOGGER.info('Checking ARP')
-
-            url = 'http://{}/Status_Wireless.live.asp'.format(self.host)
-            data = self.get_ddwrt_data(url)
-
-            if not data:
-                return False
+            _LOGGER.info('Checking wireless clients')
 
             self.last_results = []
 
-            active_clients = data.get('active_wireless', None)
+            active_clients = self.get_ddwrt_data()
+
             if not active_clients:
                 return False
 
-            # The DD-WRT UI uses its own data format and then
-            # regex's out values so this is done here too
-            # Remove leading and trailing single quotes.
-            clean_str = active_clients.strip().strip("'")
-            elements = clean_str.split("','")
-
-            self.last_results.extend(item for item in elements
-                                     if _MAC_REGEX.match(item))
+            self.last_results.extend(active_clients)
 
             return True
 
-    def get_ddwrt_data(self, url):
-        """Retrieve data from DD-WRT and return parsed result."""
+    def http_connection(self, url):
+        """Retrieve data from DD-WRT by http."""
         try:
             response = requests.get(
                 url,
                 auth=(self.username, self.password),
                 timeout=4)
         except requests.exceptions.Timeout:
-            _LOGGER.exception('Connection to the router timed out')
+            _LOGGER.error('Connection to the router timed out')
             return
         if response.status_code == 200:
+            _LOGGER.debug('Received {0}'.format(response.text))
             return _parse_ddwrt_response(response.text)
         elif response.status_code == 401:
             # Authentication error
-            _LOGGER.exception(
+            _LOGGER.error(
                 'Failed to authenticate, '
                 'please check your username and password')
             return
         else:
             _LOGGER.error('Invalid response from ddwrt: %s', response)
 
+    def ssh_connection(self, host, cmds):
+        """Retrieve data from DD-WRT by ssh."""
+        from pexpect import pxssh, exceptions
+
+        ssh = pxssh.pxssh()
+        try:
+            ssh.login(host, self.username, **self.ssh_secret)
+        except exceptions.EOF as err:
+            _LOGGER.error('Connection refused. Is SSH enabled?')
+            return None
+        except pxssh.ExceptionPxssh as err:
+            _LOGGER.error('Unable to connect via SSH: %s', str(err))
+            return None
+
+        try:
+            output = []
+            for cmd in cmds:
+                ssh.sendline(cmd)
+                ssh.prompt()
+                output.append(ssh.before.split(b'\n')[1:-1])
+            ssh.logout()
+            _LOGGER.debug('Commands {0} in {1} returned {2}'.format(host,
+                                                                    str(cmds),
+                                                                    str(
+                                                                        output)))
+            return output
+
+        except pxssh.ExceptionPxssh as exc:
+            _LOGGER.error('Unexpected response from router: %s', exc)
+            return None
+
+    def get_ddwrt_data(self):
+        """Retrieve data from DD-WRT and return parsed result."""
+        if self.protocol == 'http':
+            if not self.hostname_cache:
+                _LOGGER.debug('Getting hostnames')
+                # get hostnames from dhcp leases
+                url = 'http://{}/Status_Lan.live.asp'.format(self.host)
+                data = self.http_connection(url)
+
+                # no data received
+                if data is None:
+                    _LOGGER.debug('No hostname data received')
+                    return None
+
+                dhcp_leases = data.get('dhcp_leases', None)
+
+                # parse and cache leases
+                if dhcp_leases:
+                    _LOGGER.debug('Parsing http leases')
+                    self.hostname_cache = _parse_http_leases(dhcp_leases)
+
+            _LOGGER.debug('Getting active clients')
+            # get active wireless clients
+            url = 'http://{}/Status_Wireless.live.asp'.format(self.host)
+            data = self.http_connection(url)
+
+            if data is None:
+                _LOGGER.debug('No active clients received')
+                return None
+
+            _LOGGER.debug('Parsing http clients')
+            return _parse_http_wireless(data.get('active_wireless', None))
+
+        elif self.protocol == 'ssh':
+            from pexpect import pxssh, exceptions
+
+
+            active_clients = []
+            # loop through all aps
+            if self.use_iw:
+                ssh = pxssh.pxssh()
+                for ap in self.aps:
+                    try:
+                        ssh.login(ap, self.username, **self.ssh_secret)
+                    except exceptions.EOF as err:
+                        _LOGGER.error('Connection refused. Is SSH enabled?')
+                        return None
+                    except pxssh.ExceptionPxssh as err:
+                        _LOGGER.error('Unable to connect via SSH: %s',
+                                      str(err))
+                        return None
+
+                    ssh.sendline(_DDWRT_LEASES_CMD)
+                    ssh.prompt()
+                    output = _parse_ssh_output(ssh.before)
+                    for line in output:
+                        mac, host = line.split(",", 1)
+                        self.hostname_cache.setdefault(mac.lower(),
+                                                       host.strip())
+
+                    ssh.sendline(_DDWRT_IW_INTERFACES_CMD)
+                    ssh.prompt()
+                    interfaces = _parse_ssh_output(ssh.before)
+                    active_clients = []
+                    for interface in interfaces:
+                        ssh.sendline(
+                            _DDWRT_IW_STATIONS_CMD.format(interface=interface))
+                        ssh.prompt()
+                        output = _parse_ssh_output(ssh.before)
+                        active_clients.extend(
+                            map(lambda m: m.lower(), output))
+            else:
+                if not self.hostname_cache:
+                    host_data = self.ssh_connection(self.host,
+                                                    [_DDWRT_LEASES_CMD,
+                                                     _DDWRT_WL_CMD])
+                    _LOGGER.debug(
+                        'host_cache_data: {0}'.format(str(host_data)))
+                    if not host_data:
+                        return None
+
+                    self.hostname_cache = {l.split(",")[0]: l.split(",")[1]
+                                           for l in host_data[0]}
+                    active_clients = [mac.lower() for mac in host_data[1]]
+                else:
+                    host_data = self.ssh_connection(self.host, [_DDWRT_WL_CMD])
+                    _LOGGER.debug('host_data: {0}'.format(str(host_data)))
+                    if host_data:
+                        active_clients = [mac.lower() for mac in host_data[0]]
+
+                for ap in self.aps:
+                    ap_data = self.ssh_connection(ap, [_DDWRT_WL_CMD])
+                    _LOGGER.debug('ap_data: {0}'.format(str(ap_data)))
+                    if ap_data:
+                        active_clients.extend([m.lower() for m in ap_data[0]])
+
+            return active_clients
+
+
+def _parse_ssh_output(data):
+    data = data.decode('ascii')
+    return data.split('\r\n')[1:-1]
+
 
 def _parse_ddwrt_response(data_str):
     """Parse the DD-WRT data format."""
-    return {
-        key: val for key, val in _DDWRT_DATA_REGEX
-        .findall(data_str)}
+    return {key: val for key, val in _DDWRT_DATA_REGEX.findall(data_str)}
+
+
+def _parse_http_leases(dhcp_leases):
+    """Parse lease data returned by web."""
+    # Remove leading and trailing quotes and spaces
+    cleaned_str = dhcp_leases.replace(
+        "\"", "").replace("\'", "").replace(" ", "")
+    elements = cleaned_str.split(',')
+    num_clients = int(len(elements) / 5)
+    hostname_cache = {}
+    for idx in range(0, num_clients):
+        # The data is a single array
+        # every 5 elements represents one host, the MAC
+        # is the third element and the name is the first.
+        mac_index = (idx * 5) + 2
+        if mac_index < len(elements):
+            mac = elements[mac_index]
+            hostname_cache[mac] = elements[idx * 5]
+
+    return hostname_cache
+
+
+def _parse_http_wireless(active_wireless):
+    """Parse wireless data returned by web."""
+    if not active_wireless:
+        return False
+
+    # The DD-WRT UI uses its own data format and then
+    # regex's out values so this is done here too
+    # Remove leading and trailing single quotes.
+    clean_str = active_wireless.strip().strip("'")
+    elements = clean_str.split("','")
+
+    return [item for item in elements if _MAC_REGEX.match(item)]
