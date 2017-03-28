@@ -8,7 +8,7 @@ import logging
 import re
 import threading
 from datetime import timedelta
-
+import time
 import requests
 import voluptuous as vol
 
@@ -19,13 +19,15 @@ from homeassistant.const import CONF_HOST, CONF_HOSTS, CONF_PASSWORD, \
     CONF_USERNAME
 from homeassistant.util import Throttle
 
+from pexpect import pxssh, exceptions
+
 # Return cached results if last scan was less then this time ago.
 MIN_TIME_BETWEEN_SCANS = timedelta(seconds=5)
 
 CONF_PROTOCOL = 'protocol'
 CONF_SSH_KEY = 'ssh_key'
 HOST_GROUP = 'Single host or list of hosts'
-CONF_USE_IW = 'use_iw'
+
 _LOGGER = logging.getLogger(__name__)
 
 REQUIREMENTS = ['pexpect==4.0.1']
@@ -34,11 +36,12 @@ _DDWRT_DATA_REGEX = re.compile(r'\{(\w+)::([^\}]*)\}')
 _MAC_REGEX = re.compile(r'(([0-9A-Fa-f]{1,2}\:){5}[0-9A-Fa-f]{1,2})')
 
 _DDWRT_LEASES_CMD = 'cat /tmp/dnsmasq.leases | awk \'{print $2","$4}\''
-_DDWRT_WL_CMD = ('wl -i eth1 assoclist | awk \'{print $2}\' && '
-                 'wl -i eth2 assoclist | awk \'{print $2}\' ;')
-_DDWRT_IW_INTERFACES_CMD = 'iw dev | grep Interface | awk \'{print $2}\''
-_DDWRT_IW_STATIONS_CMD = 'iw dev {interface} station dump | grep Station ' \
-                         ' | awk \'{{ print $2}}\''
+_DDWRT_WL_CMD = ('nvram show 2> /dev/null | grep \'wl._ifname\' | awk -F '
+                 '\'=\' \'{cmd="wl -i " $2 " assoclist"; while(cmd | '
+                 'getline var) print var}\' | awk \'{print $2}\'')
+_DDWRT_IW_CMD = ('iw dev | grep Interface | awk \'{cmd="iw dev " $2 " station'
+                 ' dump"; while(cmd | getline var) print var}\' | grep Station'
+                 ' | awk \'{print $2}\'')
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Exclusive(CONF_HOST, HOST_GROUP): cv.string,
@@ -48,7 +51,6 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Optional(CONF_PROTOCOL, default='http'):
         vol.In(['http', 'ssh']),
     vol.Optional(CONF_SSH_KEY): cv.isfile,
-    vol.Optional(CONF_USE_IW, default=False): cv.boolean
 })
 
 
@@ -80,7 +82,6 @@ class DdWrtDeviceScanner(DeviceScanner):
         self.password = config.get(CONF_PASSWORD, '')
         self.protocol = config[CONF_PROTOCOL]
         self.ssh_key = config.get(CONF_SSH_KEY, '')
-        self.use_iw = config[CONF_USE_IW]
 
         if self.protocol == 'ssh':
             if self.ssh_key:
@@ -91,6 +92,14 @@ class DdWrtDeviceScanner(DeviceScanner):
                 _LOGGER.error('No password or private key specified')
                 self.success_init = False
                 return
+            # check if we should use iw command instead of wl
+            data = self.ssh_connection(self.host, ['wl ver'])
+
+            if len(data[0]) > 1:
+            # if 'version' in data[0][1]:
+                self.ddwrt_cmd = _DDWRT_WL_CMD
+            else:
+                self.ddwrt_cmd = _DDWRT_IW_CMD
         else:
             if not self.password:
                 _LOGGER.error('No password specified')
@@ -101,7 +110,6 @@ class DdWrtDeviceScanner(DeviceScanner):
 
         self.last_results = {}
         self.hostname_cache = {}
-
         data = self.get_ddwrt_data()
         if data is None:
             raise ConnectionError('Cannot connect to DD-Wrt router')
@@ -169,7 +177,10 @@ class DdWrtDeviceScanner(DeviceScanner):
 
         ssh = pxssh.pxssh()
         try:
+            s = time.time()
             ssh.login(host, self.username, **self.ssh_secret)
+            e = time.time()
+            print("Login Time: %s" % str(e-s))
         except exceptions.EOF as err:
             _LOGGER.error('Connection refused. Is SSH enabled?')
             return None
@@ -180,14 +191,16 @@ class DdWrtDeviceScanner(DeviceScanner):
         try:
             output = []
             for cmd in cmds:
+                if len(cmd) > 80:
+                    long_command = True
+                else:
+                    long_command = False
                 ssh.sendline(cmd)
                 ssh.prompt()
-                output.append(ssh.before.split(b'\n')[1:-1])
+                output.append(_parse_ssh_output(ssh.before, long_command))
             ssh.logout()
-            _LOGGER.debug('Commands {0} in {1} returned {2}'.format(host,
-                                                                    str(cmds),
-                                                                    str(
-                                                                        output)))
+            msg = 'Commands {0} in {1} returned {2}'
+            _LOGGER.debug(msg.format(str(cmds), host, str(output)))
             return output
 
         except pxssh.ExceptionPxssh as exc:
@@ -229,82 +242,41 @@ class DdWrtDeviceScanner(DeviceScanner):
 
         elif self.protocol == 'ssh':
             active_clients = []
-            if self.use_iw:
-                from pexpect import pxssh, exceptions
-                ssh = pxssh.pxssh()
-                # setup to loop through multiple aps/devices.
-                # this is better configured in __init__
-                if len(self.aps) == 0:
-                    devices = [self.host, ]
-                else:
-                    devices = self.aps
-                # loop through all of the APs/devices to get device data
-                for d in devices:
-                    try:
-                        ssh.login(d, self.username, **self.ssh_secret)
-                    except exceptions.EOF as err:
-                        _LOGGER.error('Connection refused. Is SSH enabled?')
-                        return None
-                    except pxssh.ExceptionPxssh as err:
-                        _LOGGER.error('Unable to connect via SSH: %s',
-                                      str(err))
-                        return None
+            # when no cache get leases
+            if not self.hostname_cache:
+                host_data = self.ssh_connection(self.host,
+                                                [_DDWRT_LEASES_CMD,
+                                                 self.ddwrt_cmd])
+                _LOGGER.debug(
+                    'host_cache_data: {0}'.format(str(host_data)))
+                if not host_data:
+                    return None
 
-                    # get the dhcp leases for hostname lookup
-                    ssh.sendline(_DDWRT_LEASES_CMD)
-                    ssh.prompt()
-                    output = _parse_ssh_output(ssh.before)
-                    for line in output:
-                        mac, host = line.split(",", 1)
-                        # update the hostname cache
-                        self.hostname_cache.setdefault(mac.lower(),
-                                                       host.strip())
-
-                    # get a list of wireless interfaces
-                    ssh.sendline(_DDWRT_IW_INTERFACES_CMD)
-                    ssh.prompt()
-                    interfaces = _parse_ssh_output(ssh.before)
-
-                    # loop through each interface and get the wireless clients
-                    for interface in interfaces:
-                        ssh.sendline(
-                            _DDWRT_IW_STATIONS_CMD.format(interface=interface))
-                        ssh.prompt()
-                        output = _parse_ssh_output(ssh.before)
-                        active_clients.extend(
-                            map(lambda m: m.lower(), output))
+                self.hostname_cache = {l.split(",")[0]: l.split(",")[1]
+                                       for l in host_data[0]}
+                active_clients = [mac.lower() for mac in host_data[1]]
             else:
-                if not self.hostname_cache:
-                    host_data = self.ssh_connection(self.host,
-                                                    [_DDWRT_LEASES_CMD,
-                                                     _DDWRT_WL_CMD])
-                    _LOGGER.debug(
-                        'host_cache_data: {0}'.format(str(host_data)))
-                    if not host_data:
-                        return None
+                host_data = self.ssh_connection(self.host, [self.ddwrt_cmd])
+                _LOGGER.debug('host_data: {0}'.format(str(host_data)))
+                if host_data:
+                    active_clients = [mac.lower() for mac in host_data[0]]
 
-                    self.hostname_cache = {l.split(",")[0]: l.split(",")[1]
-                                           for l in host_data[0]}
-                    active_clients = [mac.lower() for mac in host_data[1]]
-                else:
-                    host_data = self.ssh_connection(self.host, [_DDWRT_WL_CMD])
-                    _LOGGER.debug('host_data: {0}'.format(str(host_data)))
-                    if host_data:
-                        active_clients = [mac.lower() for mac in host_data[0]]
-
-                for ap in self.aps:
-                    ap_data = self.ssh_connection(ap, [_DDWRT_WL_CMD])
-                    _LOGGER.debug('ap_data: {0}'.format(str(ap_data)))
-                    if ap_data:
-                        active_clients.extend([m.lower() for m in ap_data[0]])
+            for ap in self.aps:
+                ap_data = self.ssh_connection(ap, [self.ddwrt_cmd])
+                _LOGGER.debug('ap_data: {0}'.format(str(ap_data)))
+                if ap_data:
+                    active_clients.extend([m.lower() for m in ap_data[0]])
 
             return active_clients
 
 
-def _parse_ssh_output(data):
+def _parse_ssh_output(data, long_command=False):
     """parse output from ssh"""
     data = data.decode('ascii')
-    return data.split('\r\n')[1:-1]
+    if long_command:
+        return data.split('\r\n')[2:-1]
+    else:
+        return data.split('\r\n')[1:-1]
 
 
 def _parse_ddwrt_response(data_str):
@@ -344,3 +316,79 @@ def _parse_http_wireless(active_wireless):
     elements = clean_str.split("','")
 
     return [item for item in elements if _MAC_REGEX.match(item)]
+
+
+class SSHConnection(object):
+    """
+        manages an SSH connection to a host
+    """
+
+    def __init__(self, host, username, password='',
+                 ssh_key=None, timeout=5):
+        self.host = host
+        self.username = username
+        self.password = password
+        self.ssh_key = ssh_key
+        self.timeout = timeout
+        self._connect()
+
+    @property
+    def is_alive(self):
+        """ issue some kind of command to see if the connection is alive """
+        self.ssh.sendline("clear")
+        return self.ssh.prompt()
+
+    def _connect(self):
+        self.ssh = pxssh.pxssh(timeout=self.timeout)
+        self.ssh.login(self.host, self.username, password=self.password,
+                       ssh_key=self.ssh_key)
+
+    def send_and_parse(self, cmd):
+        """ helper method which sends the cmd, parses and returns the
+        results """
+        if not self.is_alive:
+            # try reconnecting once if the connection is not alive
+            self._connect()
+
+        self.ssh.sendline(cmd)
+        self.ssh.prompt()
+        results = []
+        data = self.ssh.before.decode('ascii').split('\r\n')
+        for item in data[:-1]:
+            if cmd.count(item.strip()) == 0:
+                results.append(item)
+        return results
+
+    def issue_cmds(self, cmds):
+        """ helper method to issue a series of commands,
+            parse each result and return results as a list"""
+        output = []
+        for cmd in cmds:
+            output.append(self.send_and_parse(cmd))
+        return output
+
+
+class SSHConnections(object):
+    """
+        collection of SSHConnection
+    """
+
+    def __init__(self):
+        self.connections = {}
+
+    def add_connection(self, host, username, password='',
+                       ssh_key=None):
+        ssh = SSHConnection(host, username, password=password,
+                            ssh_key=ssh_key)
+        self.connections[host] = ssh
+
+    def is_alive(self, host):
+        return self.connections[host].is_alive
+
+    def send_and_parse(self, host, cmd):
+        return self.connections[host].send_and_parse(cmd)
+
+    def issue_cmds(self, host, cmds):
+        return self.connections[host].issue_cmds(cmds)
+
+
