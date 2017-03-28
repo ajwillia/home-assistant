@@ -226,16 +226,21 @@ class DdWrtDeviceScanner(DeviceScanner):
 
             # make sure the ssh connection helper has the host
             if self.ssh_cons.has_host(self.host):
+                # if the host is not connected, try to reconnect
+                if not self.ssh_cons.is_connected(self.host):
+                    self._add_ssh_host_and_check_wl(self.host)
+
                 cmds = (_DDWRT_LEASES_CMD,
                         self.host_ddwrt_cmd_lookup[self.host])
                 leases, clients = self.ssh_cons.issue_cmds(self.host, cmds)
 
                 # convert leases into dict splitting on first comma
-                host_data = dict(map(lambda l: l.split(',', 1), leases))
-
-                # update hostname_cache
-                self.hostname_cache.update(host_data)
-                active_clients.extend(clients)
+                if leases is not None:
+                    host_data = dict(map(lambda l: l.split(',', 1), leases))
+                    # update hostname_cache
+                    self.hostname_cache.update(host_data)
+                if clients is not None:
+                    active_clients.extend(clients)
             else:
                 # it doesn't so try and add.  will wait until next
                 # event loop to get the data
@@ -243,9 +248,14 @@ class DdWrtDeviceScanner(DeviceScanner):
 
             for ap in self.aps:
                 if self.ssh_cons.has_host(ap):
+                    # if the AP is not connected, try to reconnect
+                    if not self.ssh_cons.is_connected(ap):
+                        self._add_ssh_host_and_check_wl(ap)
+
                     cmd = self.host_ddwrt_cmd_lookup[ap]
                     clients = self.ssh_cons.send_and_parse(ap, cmd)
-                    active_clients.extend(clients)
+                    if clients is not None:
+                        active_clients.extend(clients)
                 else:
                     self._add_ssh_host_and_check_wl(ap)
             return active_clients
@@ -302,33 +312,35 @@ class SSHConnection(object):
         self.password = password
         self.ssh_key = ssh_key
         self.timeout = timeout
+        self.connected = False
         self._connect()
 
-    @property
-    def is_alive(self):
-        """ issue some kind of command to see if the connection is alive """
-        self.ssh.sendline("clear")
-        return self.ssh.prompt()
-
     def _connect(self):
-        self.ssh = pxssh.pxssh(timeout=self.timeout)
-        self.ssh.login(self.host, self.username, password=self.password,
-                       ssh_key=self.ssh_key)
+        try:
+            self.ssh = pxssh.pxssh(timeout=self.timeout)
+            self.ssh.login(self.host, self.username, password=self.password,
+                           ssh_key=self.ssh_key)
+            self.connected = True
+        except Exception as e:
+            self.connected = False
+            raise e
 
     def send_and_parse(self, cmd):
         """ helper method which sends the cmd, parses and returns the
         results """
-        if not self.is_alive:
-            # try reconnecting once if the connection is not alive
-            self._connect()
-
-        self.ssh.sendline(cmd)
-        self.ssh.prompt()
-        results = []
-        data = self.ssh.before.decode('ascii').split('\r\n')
-        for item in data[:-1]:
-            if cmd.count(item.strip()) == 0:
-                results.append(item)
+        try:
+            self.ssh.sendline(cmd)
+            self.ssh.prompt()
+            results = []
+            data = self.ssh.before.decode('ascii').split('\r\n')
+            for item in data[:-1]:
+                if cmd.count(item.strip()) == 0:
+                    results.append(item)
+        except exceptions.EOF:
+            _LOGGER.error('%s Connection refused. Is SSH enabled?' %
+                          self.host)
+            results = None
+            self.connected = False
         return results
 
     def issue_cmds(self, cmds):
@@ -356,15 +368,12 @@ class SSHConnections(object):
     def has_host(self, host):
         return host in self.hosts.keys()
 
-    def is_alive(self, host):
-        return self.hosts[host].is_alive
+    def is_connected(self, host):
+        return self.hosts[host].connected
 
     def send_and_parse(self, host, cmd):
         return self.hosts[host].send_and_parse(cmd)
 
     def issue_cmds(self, host, cmds):
         return self.hosts[host].issue_cmds(cmds)
-
-    def send_and_parse(self, host, cmd):
-        return self.hosts[host].send_and_parse(cmd)
 
